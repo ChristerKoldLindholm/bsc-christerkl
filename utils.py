@@ -32,6 +32,7 @@ def max_len_collate(batch):
     lengths = torch.tensor([w.shape[-1] for w in waves])
     max_len = int(lengths.max())
     pad_waves = [F.pad(w, (0, max_len - w.shape[-1])) for w in waves]
+    # Keep original lengths for later data processing. 
     items = [(pad_waves[i], srs[i], paths[i], lengths[i]) for i in range(len(batch))]
     
     return default_collate(items)
