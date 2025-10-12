@@ -7,9 +7,12 @@ from torch.utils.data import Dataset, default_collate
 
 # Dataloader built based on PyTorch tutorial.
 class AudioDataset(Dataset):
-    def __init__(self, root, target_sr=64000, max_secs=None):
-        self.files = list(Path(root).rglob("*.wav")) # Root data folder.
+    def __init__(self, root_dir, target_sr=64000, skip_secs=5, mode="crop", max_secs=None):
+        self.root_dir = Path(root_dir)
+        self.files = list(self.root_dir.rglob("*.wav")) # Root data folder.
         self.target_sr = target_sr # Can change from original raw 64 kHz to common 16 kHz.
+        self.skip_secs = skip_secs # Skip a recording's first corrupted seconds.
+        self.mode = mode # "crop" or "mute" the corrupted recording segment.
         self.max_frames = int(target_sr * max_secs) if max_secs else None # Truncation for plotting.
 
     def __len__(self):
@@ -18,13 +21,26 @@ class AudioDataset(Dataset):
     def __getitem__(self, idx):
         path = self.files[idx]
         wf, sr = ta.load(path)
+        # For the entire dataset, each waveform shape is [C, T] where C = 1 (mono), 
+        # T (the number of frames) is approximately = 172 million,
+        # and is recorded at sample rate = 64 kHz.
+        
+        # Skip corrupted beginning of every recording.
+        s_idx = int(self.skip_secs * sr)
+        if self.mode == "crop":
+            wf = wf[:, s_idx:] if wf.shape[1] > s_idx else torch.zeros((wf.shape[0], 1))
+        elif self.mode == "mute":
+             wf = wf.clone()
+             s = min(s_idx, wf.shape[-1])
+             wf[:, :s] = 0.0
 
         if sr != self.target_sr:
             wf = ta.functional.resample(wf, sr, self.target_sr)
             sr = self.target_sr 
         
-        if self.max_frames: 
-            wf = wf[:, :self.max_frames]
+        if self.max_frames is not None:
+            max_len = int(self.max_secs * sr)
+            wf = wf[:, :max_len]
 
         return wf, sr, str(path)
 
@@ -78,6 +94,72 @@ def plot_waveform_fast(waveform, sample_rate, max_pts:int=30_000, title:str="Wav
     plt.tight_layout()
     
     return fig, ax 
+
+def plot_specgram(waveform, sample_rate, config:dict, title:str="Spectrogram", ax=None):
+    
+    n_channels, n_frames = waveform.shape
+    wf = waveform.numpy()
+
+    if ax is None: 
+        fig, ax = plt.subplots(n_channels, 1, figsize=(7,6))
+    else: 
+        fig = None
+
+
+    ax.specgram(wf[0], Fs=sample_rate
+                , NFFT=config['n_fft']
+                , noverlap=config['n_fft'] - config['hop_length']
+                , window=config['window_fn'](config['win_length']).numpy()
+                , mode='magnitude'
+                , scale_by_freq=True
+                , sides='default'
+                , cmap='viridis')
+
+    ax.set_xlabel("Time (seconds)")
+    ax.set_ylabel("Frequency (kHz)")
+    yticks = ax.get_yticks()
+    ax.set_yticklabels([f"{y/1000:.0f}k" for y in yticks])
+    ax.set_title(title)
+    plt.tight_layout()
+
+    return fig, ax
+
+def plot_nm_specgrams(n_rows:int, m_cols:int, wavelist:list, fname:str="spectro_graph", fig_size=(9, 9), data_path=Path, graph_path=Path):
+    fig, axes = plt.subplots(n_rows, m_cols, figsize=fig_size)
+    axes = axes.flatten()
+
+    for i, wav in enumerate(wavelist):
+        if i >= len(axes):
+            break
+
+        p = Path(data_path / wav)
+        wf, sr = ta.load(str(p))
+        plot_specgram(wf, sr, title=p.name, ax=axes[i])
+
+    if graph_path is None:
+        graph_path = Path().resolve().parent / "graphs"
+    plt.savefig(fname=graph_path / f"{fname}.png", bbox_inches='tight', pad_inches=0.2, dpi=300)
+    plt.tight_layout()
+
+    return fig, axes
+
+def plot_nm_waveforms(n_rows:int, m_cols:int, wavelist:list, fname:str="waveform_graph", fig_size=(9, 9), data_path=Path, graph_path=Path):
+    fig, axes = plt.subplots(n_rows, m_cols, figsize=fig_size)
+    axes = axes.flatten()
+
+    max_points = 30_000
+    for i, wav in enumerate(wavelist):
+        if i >= len(axes):
+            break 
+
+        p = Path(data_path / wav)
+        wf, sr = ta.load(str(p))
+        plot_waveform_fast(wf, sr, max_pts=max_points, title=p.name, ax=axes[i])
+
+    plt.savefig(fname=graph_path / f"{fname}.png", bbox_inches='tight', dpi=300)
+    plt.tight_layout()
+    
+    return fig, axes
 
 # Computes descriptive statistics: peak amplitudes, mean amplitudes, 
 # root mean squares and zero-crossing rates
