@@ -1,12 +1,26 @@
-import matplotlib.pyplot as plt
+import numpy as np
 from pathlib import Path
 import torch 
-import torchaudio as ta 
+import torchaudio as ta
+import torchaudio.transforms as T
 import torch.nn.functional as F
-from torch.utils.data import Dataset, default_collate
+from torch.utils.data import Dataset
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Dataloader built based on PyTorch tutorial.
+# Uses helper max_len_collate() function below.
 class AudioDataset(Dataset):
+    """Audio dataset class suited for the hydroacoustic dataset from 
+    Inglefield Bredning Fjord, Greenland. Helper function 
+    max_len_collate() determines the final output batch contents: 
+    (waves, srs, paths, lengths).
+    Returns:
+        A dictionary with keys:
+            "waveform": torch.Tensor of shape [C, T]
+            "sample_rate": int
+            "path": str, path to the audio file
+    """
     def __init__(self, root_dir, target_sr=64000, skip_secs=5, mode="crop", max_secs=None):
         self.root_dir = Path(root_dir)
         self.files = list(self.root_dir.rglob("*.wav")) # Root data folder.
@@ -36,130 +50,200 @@ class AudioDataset(Dataset):
 
         if sr != self.target_sr:
             wf = ta.functional.resample(wf, sr, self.target_sr)
-            sr = self.target_sr 
-        
+            sr = self.target_sr
+
         if self.max_frames is not None:
             max_len = int(self.max_secs * sr)
             wf = wf[:, :max_len]
 
-        return wf, sr, str(path)
+        item = {"waveform": wf, "sample_rate": sr, "path": str(path)}
+
+        return item
 
 # Collates tensors in a batch by padding to the max length tensor.
 def max_len_collate(batch):
-    waves, srs, paths = zip(*batch)
-    lengths = torch.tensor([w.shape[-1] for w in waves])
-    max_len = int(lengths.max())
-    pad_waves = [F.pad(w, (0, max_len - w.shape[-1])) for w in waves]
-    # Keep original lengths for later data processing. 
-    items = [(pad_waves[i], srs[i], paths[i], lengths[i]) for i in range(len(batch))]
+    # waves, srs, paths = zip(*batch)
+    waves = [b["waveform"] for b in batch] # List of [C, T] tensors.
+    C = waves[0].shape[0]
+    max_len = max([w.shape[-1] for w in waves])
+    padded = []
+    lengths = []
+    for w in waves:
+        pad_T = max_len - w.shape[-1]
+        padded.append(F.pad(w, (0, pad_T))) # Pad last dimension.
+        lengths.append(w.shape[-1])
+    waves = torch.stack(padded) # [B, C, T]
+
+    output = {
+        "waveforms": waves,
+        "sample_rates": batch[0]["sample_rate"], # All sample rates are the same.
+        "paths": [b["path"] for b in batch],
+        "lengths": torch.tensor(lengths), # Keep original lengths for later data processing.
+    }
+    return output 
+
+# A preprocessing pipeline class for audio features. 
+class PipelineSpecgram(torch.nn.Module):
+    def __init__(self, specgram_config:dict):
+        super().__init__()
+        # Basic spectrogram settings.
+        self.sample_rate = specgram_config["sample_rate"]
+        self.n_fft = specgram_config["n_fft"]
+        self.win_length = specgram_config["win_length"]
+        self.hop_length = specgram_config["hop_length"]
+        self.window_fn = specgram_config["window_fn"]
+        # Optional spectrogram settings.
+        self.resample_rate = specgram_config.get("resample_rate", None)
+        self.mel_bins = specgram_config.get("n_mels", None)
+        self.power = specgram_config.get("power", 2.0)
+        self.to_db = T.AmplitudeToDB(stype="power") # Decibel conversion.
+
+        if self.resample_rate is not None and self.resample_rate != self.sample_rate:
+            self.resample = T.Resample(orig_freq=self.sample_rate, new_freq=self.resample_rate)
+            self.effective_sr = self.resample_rate
+        else:
+            self.resample = torch.nn.Identity() # Placeholder identity.
+            self.effective_sr = self.sample_rate
+
+        # Setup spectrogram. 
+        self.spec = T.Spectrogram(
+            n_fft=self.n_fft,
+            win_length=self.win_length,
+            hop_length=self.hop_length,
+            window_fn=self.window_fn,
+            power=self.power,
+            center=True,
+            pad_mode="reflect"
+        )
+
+        # Mel scale transformation.
+        if self.mel_bins is not None:
+            # Mel scale produces power mel bands.
+            self.mel_scale = T.MelScale(
+                n_mels = self.mel_bins,
+                sample_rate = self.effective_sr,
+                n_stft = self.n_fft // 2 + 1, # = n_freqs
+                f_min = 0.0,
+                f_max = self.effective_sr / 2.0, # = 32 kHz according to the Nyquist theorem.
+                mel_scale="htk", # Default is "htk". 
+                # norm="slaney"
+            )
+        else:
+            self.mel_scale = None 
     
-    return default_collate(items)
+    def forward(self, waveform: torch.Tensor) -> torch.Tensor:
+        x = self.resample(waveform) # Skips resampling if Identity was called.
+        spec = self.spec(x) # Applies the power spectrogram settings to each input waveform.
+        # Returns shape [C, F, T] for channels, freq bins and time frames.
+        
+        # p_ref is in Pa^2. Divide by micro-Pascals squared to get reference level.
+        spec_ref = spec / (1e-6**2) 
 
-# Plots the pure waveform vector.
-def plot_waveform(waveform, sample_rate):
-    waveform = waveform.numpy()
-    num_channels, num_frames = waveform.shape
-    time_ax = torch.arange(0, num_frames) / sample_rate
+        if self.mel_scale is not None: 
+            mel = self.mel_scale(spec_ref)
+            # Returns shape [C, M, T] for channels, mel bins and time frames. 
+            mel_db = self.to_db(mel) # AmplitudeToDB(stype='power') produces log-mel dB. 
+            return mel_db
+        else: 
+            spec_db = self.to_db(spec_ref)
+            return spec_db
 
-    fig, ax = plt.subplots(num_channels, 1)
-    ax.plot(time_ax, waveform[0], linewidth=1, color="royalblue", alpha=0.8)
-    ax.grid(True)
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Amplitude")
-    plt.tight_layout()
-    fig.suptitle("Waveform")
-
-# Plots a waveform vector points at defined stride intervals for faster visualization.
-def plot_waveform_fast(waveform, sample_rate, max_pts:int=30_000, title:str="Waveform", ax=None):
-    n_channels, n_frames = waveform.shape
-    # Truncation steps only for visualizing waveforms.
-    stride = max(1, n_frames // max_pts) 
-    wf_visual = waveform[:, ::stride]
-    # Time in seconds: time = frames / sample_rate and strides are frames divided by steps.  
-    t = torch.arange(wf_visual.shape[1], dtype=torch.float32) * (stride / sample_rate) 
-
-    wf_visual = wf_visual.cpu().numpy()
-    t = t.cpu().numpy()
-
-    if ax is None: 
-        fig, ax = plt.subplots(figsize=(8, 5))
-    else: 
-        fig = None
-
-    ax.plot(t, wf_visual[0], linewidth=1, color="royalblue", alpha=0.8)
-    ax.grid(True, linewidth=0.5, alpha=0.5)
-    ax.set_xlabel("Time (seconds)")
-    ax.set_ylabel("Amplitude")
-    ax.set_title(title)
-    plt.tight_layout()
+# Helper function to reduce the number of sample points in audio data tensors.
+def reduce_tensor(w, max_pts):
+    """
+    Reduces a 1D tensor w to exactly max_pts elements. 
+    If w has more than max_pts elements, it is downsampled using fixed indices.
+    If w has fewer than max_pts elements, it is padded with zeros at the end.
+    Args:
+        w: 1D torch.Tensor.
+        max_pts: Maximum number of elements in the output tensor.
+    Returns:
+        w_small: Reduced or padded 1D tensor of length max_pts.
+    """
+    # Downsample to max_pts using fixed indices.
+    n_elms = w.numel()
+    if n_elms == max_pts:
+        return w 
     
-    return fig, ax 
-
-def plot_specgram(waveform, sample_rate, config:dict, title:str="Spectrogram", ax=None):
+    if n_elms == 0:
+        return torch.zeros(max_pts, device=w.device, dtype=w.dtype)
     
-    n_channels, n_frames = waveform.shape
-    wf = waveform.numpy()
+    if n_elms >= max_pts:
+        k = torch.arange(max_pts, device=w.device)
+        idx = torch.floor(k.to(torch.float32) * (n_elms / float(max_pts))).to(torch.long)
+        # idx = torch.linspace(0, n_elms - 1, steps=max_pts, device=w.device).to(torch.long)
+        w_small = w.index_select(0, idx)
+    else:
+        # Padding needed at dataset level to build X (data loader pads at batch-level).
+        w_small = F.pad(w, (0, max_pts - n_elms))
+    return w_small
 
-    if ax is None: 
-        fig, ax = plt.subplots(n_channels, 1, figsize=(7,6))
-    else: 
-        fig = None
+# Builds feature matrix Z as inputs to clustering models.
+def tensors_to_array(dataloader, transform, max_pts=None, dtype=np.float32, device=device):
+    """
+    Builds a (N, max_pts) feature matrix Z of type NumPy array by reducing PyTorch 
+    waveform tensors. Z used as input for clustering algorithms. The size of Z can 
+    be reduced by downsampling based on a maximum number of points per audio recording.
+    Args:
+        dataloader: PyTorch DataLoader batches of audio waveforms.
+        max_pts: Maximum number of points per feature.  
+    Returns:
+        X: NumPy array of shape (n samples, n features).
+        ids: List of audio file identifiers corresponding to each row in X.
+    """
 
+    # if device is not None: 
+    #     device = next(transform.parameters()).device if hasattr(transform, "parameters") else torch.device("cpu")
 
-    ax.specgram(wf[0], Fs=sample_rate
-                , NFFT=config['n_fft']
-                , noverlap=config['n_fft'] - config['hop_length']
-                , window=config['window_fn'](config['win_length']).numpy()
-                , mode='magnitude'
-                , scale_by_freq=True
-                , sides='default'
-                , cmap='viridis')
+    rows, ids = [], []
+    transform.eval()
 
-    ax.set_xlabel("Time (seconds)")
-    ax.set_ylabel("Frequency (kHz)")
-    yticks = ax.get_yticks()
-    ax.set_yticklabels([f"{y/1000:.0f}k" for y in yticks])
-    ax.set_title(title)
-    plt.tight_layout()
+    with torch.no_grad(): # Disables gradient computations
+        for batch in dataloader:
+            waves = batch["waveforms"]
+            paths = batch["paths"]
+            lengths = batch["lengths"]
 
-    return fig, ax
+            B, C, Tn = waves.shape
 
-def plot_nm_specgrams(n_rows:int, m_cols:int, wavelist:list, fname:str="spectro_graph", fig_size=(9, 9), data_path=Path, graph_path=Path):
-    fig, axes = plt.subplots(n_rows, m_cols, figsize=fig_size)
-    axes = axes.flatten()
+            for b in range(B):
+                L = int(lengths[b].item()) if lengths is not None else Tn
+                L = max(0, min(L, Tn))
+                w = waves[b, :, :L][0]
 
-    for i, wav in enumerate(wavelist):
-        if i >= len(axes):
-            break
+                # n_elms = w.numel()
+                if max_pts is not None:
+                    T0 = w.numel()
+                    if T0 == 0:
+                        w = torch.zeros(max_pts, dtype=w.dtype)
+                    elif T0 > max_pts:
+                        k = torch.arange(max_pts, device=w.device)
+                        idx = torch.floor(k.to(torch.float32) * (T0 / float(max_pts))).to(torch.long)
+                        # idx = torch.linspace(0, w.numel()-1, steps=max_pts).long()
+                        w = w.index_select(0, idx)
+                    elif T0 < max_pts:
+                        w = F.pad(w, (0, max_pts - T0)) 
+                        # pad = max_pts - w.numel()
+                        # w = F.pad(w, (0, pad))
 
-        p = Path(data_path / wav)
-        wf, sr = ta.load(str(p))
-        plot_specgram(wf, sr, title=p.name, ax=axes[i])
+                x = w.view(1, 1, -1).to(device=device, dtype=torch.float32)
+                
+                feat = transform(x).squeeze(0)  # [C, F, T]
 
-    if graph_path is None:
-        graph_path = Path().resolve().parent / "graphs"
-    plt.savefig(fname=graph_path / f"{fname}.png", bbox_inches='tight', pad_inches=0.2, dpi=300)
-    plt.tight_layout()
+                mu = feat.mean(dim=-1, keepdim=False)
+                sig = feat.std(dim=-1, keepdim=False)
+                vec = torch.cat([mu, sig], dim=0)
+                vec = vec.reshape(-1)
 
-    return fig, axes
+                rows.append(vec.detach().cpu().numpy().astype(dtype))
 
-def plot_nm_waveforms(n_rows:int, m_cols:int, wavelist:list, fname:str="waveform_graph", fig_size=(9, 9), data_path=Path, graph_path=Path):
-    fig, axes = plt.subplots(n_rows, m_cols, figsize=fig_size)
-    axes = axes.flatten()
+                p = paths[b]
+                ids.append(Path(p).name if isinstance(p, (str, Path)) else str(p))
 
-    max_points = 30_000
-    for i, wav in enumerate(wavelist):
-        if i >= len(axes):
-            break 
-
-        p = Path(data_path / wav)
-        wf, sr = ta.load(str(p))
-        plot_waveform_fast(wf, sr, max_pts=max_points, title=p.name, ax=axes[i])
-
-    plt.savefig(fname=graph_path / f"{fname}.png", bbox_inches='tight', dpi=300)
-    plt.tight_layout()
-    
-    return fig, axes
+    # Concatenate rows into Z.
+    # Z: (n samples, n features.)
+    Z = np.stack(rows, axis=0)
+    return Z, ids
 
 # Computes descriptive statistics: peak amplitudes, mean amplitudes, 
 # root mean squares and zero-crossing rates
