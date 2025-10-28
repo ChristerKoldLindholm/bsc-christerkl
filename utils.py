@@ -9,25 +9,24 @@ from torch.utils.data import Dataset
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Dataloader built based on PyTorch tutorial.
-# Uses helper max_len_collate() function below.
+# Uses helper max_len_collate().
 class AudioDataset(Dataset):
-    """Audio dataset class suited for the hydroacoustic dataset from 
-    Inglefield Bredning Fjord, Greenland. Helper function 
-    max_len_collate() determines the final output batch contents: 
-    (waves, srs, paths, lengths).
-    Returns:
-        A dictionary with keys:
-            "waveform": torch.Tensor of shape [C, T]
-            "sample_rate": int
-            "path": str, path to the audio file
+    """Audio dataset class suited for the hydroacoustic dataset from Inglefield Bredning Fjord, 
+    Greenland. Returns a dictionary with keys: "waveform", "sample_rate", "path".
+    When called with helper function max_len_collate(), the final output batch contains: 
+            "waves": torch.Tensor of shape [C, T].
+            "sample_rates": int.
+            "paths": str, path to the audio file.
+            "lengths": int, original length of each waveform before padding.
     """
     def __init__(self, root_dir, target_sr=64000, skip_secs=5, mode="crop", max_secs=None):
-        self.root_dir = Path(root_dir)
-        self.files = list(self.root_dir.rglob("*.wav")) # Root data folder.
+        self.root_dir = Path(root_dir) # Root data folder.
+        self.files = list(self.root_dir.rglob("*.wav")) # Searches for pattern in subfolders.
         self.target_sr = target_sr # Can change from original raw 64 kHz to common 16 kHz.
         self.skip_secs = skip_secs # Skip a recording's first corrupted seconds.
         self.mode = mode # "crop" or "mute" the corrupted recording segment.
-        self.max_frames = int(target_sr * max_secs) if max_secs else None # Truncation for plotting.
+        # self.max_frames = int(target_sr * max_secs) if max_secs else None # Truncation for plotting.
+        self.max_secs = max_secs
 
     def __len__(self):
         return len(self.files)
@@ -52,7 +51,7 @@ class AudioDataset(Dataset):
             wf = ta.functional.resample(wf, sr, self.target_sr)
             sr = self.target_sr
 
-        if self.max_frames is not None:
+        if self.max_secs is not None:
             max_len = int(self.max_secs * sr)
             wf = wf[:, :max_len]
 
@@ -62,7 +61,6 @@ class AudioDataset(Dataset):
 
 # Collates tensors in a batch by padding to the max length tensor.
 def max_len_collate(batch):
-    # waves, srs, paths = zip(*batch)
     waves = [b["waveform"] for b in batch] # List of [C, T] tensors.
     C = waves[0].shape[0]
     max_len = max([w.shape[-1] for w in waves])
@@ -76,13 +74,14 @@ def max_len_collate(batch):
 
     output = {
         "waveforms": waves,
-        "sample_rates": batch[0]["sample_rate"], # All sample rates are the same.
+        "sample_rates": [b["sample_rate"] for b in batch], # All sample rates are the same.
         "paths": [b["path"] for b in batch],
         "lengths": torch.tensor(lengths), # Keep original lengths for later data processing.
     }
     return output 
 
-# A preprocessing pipeline class for audio features. 
+# A preprocessing pipeline class for audio features. Inherits methods "eval" and "train"
+# from torch.nn.Module.
 class PipelineSpecgram(torch.nn.Module):
     def __init__(self, specgram_config:dict):
         super().__init__()
@@ -181,9 +180,9 @@ def reduce_tensor(w, max_pts):
 # Builds feature matrix Z as inputs to clustering models.
 def tensors_to_array(dataloader, transform, max_pts=None, dtype=np.float32, device=device):
     """
-    Builds a (N, max_pts) feature matrix Z of type NumPy array by reducing PyTorch 
-    waveform tensors. Z used as input for clustering algorithms. The size of Z can 
-    be reduced by downsampling based on a maximum number of points per audio recording.
+    Builds a (N, max_pts) feature matrix Z of type NumPy array. Z used as input for clustering 
+    algorithms. The size of Z can be reduced by downsampling based on a maximum number of 
+    points per audio recording.
     Args:
         dataloader: PyTorch DataLoader batches of audio waveforms.
         max_pts: Maximum number of points per feature.  
@@ -192,17 +191,19 @@ def tensors_to_array(dataloader, transform, max_pts=None, dtype=np.float32, devi
         ids: List of audio file identifiers corresponding to each row in X.
     """
 
-    # if device is not None: 
-    #     device = next(transform.parameters()).device if hasattr(transform, "parameters") else torch.device("cpu")
-
     rows, ids = [], []
     transform.eval()
 
-    with torch.no_grad(): # Disables gradient computations
+    with torch.no_grad(): # Disables gradient computations.
         for batch in dataloader:
             waves = batch["waveforms"]
             paths = batch["paths"]
             lengths = batch["lengths"]
+
+            if device is None:
+                device_ = waves.device
+            else:
+                device_ = device
 
             B, C, Tn = waves.shape
 
@@ -210,35 +211,39 @@ def tensors_to_array(dataloader, transform, max_pts=None, dtype=np.float32, devi
                 L = int(lengths[b].item()) if lengths is not None else Tn
                 L = max(0, min(L, Tn))
                 w = waves[b, :, :L][0]
-
-                # n_elms = w.numel()
+                
+                T0 = w.numel()
                 if max_pts is not None:
-                    T0 = w.numel()
                     if T0 == 0:
-                        w = torch.zeros(max_pts, dtype=w.dtype)
+                        w = torch.zeros(max_pts, dtype=w.dtype, device=w.device)
                     elif T0 > max_pts:
                         k = torch.arange(max_pts, device=w.device)
                         idx = torch.floor(k.to(torch.float32) * (T0 / float(max_pts))).to(torch.long)
-                        # idx = torch.linspace(0, w.numel()-1, steps=max_pts).long()
                         w = w.index_select(0, idx)
                     elif T0 < max_pts:
                         w = F.pad(w, (0, max_pts - T0)) 
-                        # pad = max_pts - w.numel()
-                        # w = F.pad(w, (0, pad))
 
+                # Let x be the input waveform. .view reshapes to [1, 1, T] for transformation.
+                # The shape matches [B, C, T].
                 x = w.view(1, 1, -1).to(device=device, dtype=torch.float32)
                 
-                feat = transform(x).squeeze(0)  # [C, F, T]
+                feat = transform(x).squeeze(0)  # Transforms into [C, F, T] by removing the B dimension.
+                # where Channels (C = 1, mono), F = n_mels = 128, and T = n time frames.
+                # T contains the observations. The slice feat[:, :, t] is a feature vector at time frame t
+                # across all mel bins. 
 
-                mu = feat.mean(dim=-1, keepdim=False)
-                sig = feat.std(dim=-1, keepdim=False)
+                # Mean across time frames and std across time.
+                mu = feat.mean(dim=-1, keepdim=False) 
+                sig = feat.std(dim=-1, keepdim=False) 
                 vec = torch.cat([mu, sig], dim=0)
+                # Final feature vector shape: (2 * n_mels)
                 vec = vec.reshape(-1)
-
                 rows.append(vec.detach().cpu().numpy().astype(dtype))
 
                 p = paths[b]
                 ids.append(Path(p).name if isinstance(p, (str, Path)) else str(p))
+    
+    ids = np.array(ids, dtype=str)            
 
     # Concatenate rows into Z.
     # Z: (n samples, n features.)

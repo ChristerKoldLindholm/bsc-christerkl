@@ -1,0 +1,10 @@
+{
+  "specgram_config": "{'sample_rate': 64000, 'n_fft': 1024, 'win_length': 1024, 'hop_length': 512, 'window_fn': <built-in method hann_window of type object at 0x00007FF8CB0EDE90>, 'resample_rate': None, 'n_mels': 128, 'power': 2.0, 'center': True, 'pad_mode': 'reflect', 'f_min': 0.0, 'f_max': 32000.0}",
+  "max_points": 172000,
+  "dtype": "float32",
+  "shape": [
+    5,
+    256
+  ],
+  "created": "2025-10-25T09:00:02.427548"
+}
