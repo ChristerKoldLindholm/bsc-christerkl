@@ -25,13 +25,13 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--input-root", required=True, help="ERDA root folder with audio files.")
     ap.add_argument("--output-root", required=True, help="Output folder to write .npz features + index.csv.")
-    ap.add_argument("--subset-len", type=int, default=0, help="Choose a subset of data.")
+    # ap.add_argument("--subset-len", type=int, default=0, help="Choose a subset of data.")
     args = ap.parse_args()
 
     input_root = Path(args.input_root)
     output_root = Path(args.output_root)
     output_root.mkdir(parents=True, exist_ok=True)
-    subset_len = max(0, int(args.subset_len))
+    # subset_len = max(0, int(args.subset_len))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -40,12 +40,17 @@ def main():
     batch_size = 2
     dataset = utils.AudioDataset(input_root, target_sr=64_000, skip_secs=skip_secs, mode="crop", max_secs=None)
     start_idx = 0 # Create a data subset to skip to later recordings.
-    if subset_len:
-        end_idx = subset_len
-    else:
-        end_idx = len(dataset)
+    end_idx = len(dataset)
+    # if subset_len:
+    #     end_idx = subset_len
+    # else:
+    #     end_idx = len(dataset)
     subset = Subset(dataset, range(start_idx, end_idx))
     loader = DataLoader(subset, batch_size=batch_size, shuffle=False, collate_fn=utils.max_len_collate) # Only shuffle data when training.
+
+    print("len(dataset) =", len(dataset))
+    # print("len(subset)  =", len(subset))
+    print("loader batches =", len(loader))
 
     max_points = None # Used by tensors_to_array().
 

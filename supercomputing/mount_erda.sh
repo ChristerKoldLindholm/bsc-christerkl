@@ -1,11 +1,18 @@
 #!/bin/bash
-key="$HOME/.ssh/id_ed25519"
-user="trh104@alumni.ku.dk"
-erdadir="dryad_hydroacoustic_inglefield"
-mnt="$HOME/erda_bsc_christerkl"
-if [ -f "$key" ]
-then mkdir -p ${mnt}
-    sshfs ${user}@io.erda.dk:${erdadir} ${mnt} -o reconnect,ServerAliveInterval=15,ServerAliveCountMax=3 -o IdentityFile=${key}
+KEY="$HOME/.ssh/erda_job"
+USER="trh104@alumni.ku.dk"
+REMOTE_DIR="/erda_bsc_christerkl/dryad_hydroacoustic_inglefield"
+MNT="$HOME/erda_bsc_christerkl"
+if [ -f "$KEY" ]
+then 
+    mkdir -p ${MNT}
+    sshfs ${USER}@io.erda.dk:${REMOTE_DIR} ${MNT} -o reconnect,ServerAliveInterval=15,ServerAliveCountMax=3 -o IdentityFile=${KEY}
 else 
-    echo "'${key}' is not an ssh key"
-fi 
+    echo "'${KEY}' is not an ssh key"
+fi
+    # sshfs -o IdentitiesOnly=yes -o BatchMode=yes -o User="$USER" -o IdentityFile="$KEY" \
+    #   -o reconnect,ServerAliveInterval=15,ServerAliveCountMax=3 \
+    #   io.erda.dk:"$REMOTE_DIR" "$MNT"
+
+# REMOTE_DIR="dryad_hydroacoustic_inglefield"
+    # sshfs ${USER}@io.erda.dk:${REMOTE_DIR} ${MNT} -o reconnect,ServerAliveInterval=15,ServerAliveCountMax=3 -o IdentityFile=${KEY}

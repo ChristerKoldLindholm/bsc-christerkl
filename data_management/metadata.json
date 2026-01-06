@@ -1,7 +1,0 @@
-{
-  "specgram_config": {
-    "sample_rate": 64000,
-    "n_fft": 1024,
-    "win_length": 1024,
-    "hop_length": 512,
-    "window_fn": 

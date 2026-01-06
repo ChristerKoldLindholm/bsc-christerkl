@@ -1,0 +1,4 @@
+job,n_recs,pct_recs,n_tasks,cpus_per_task,mem_GB,gpu_name,gpus,batch_size,runtime_min,runtime_hr,comment
+logmel_erda,4420.0,0.3653194478882552,1.0,4,24,titan_rtx,4,2.0,360.0,6.0,Iterates over the dataset twice.
+clustering,4420.0,0.3653194478882552,1.0,8,20,titan_rtx,2,,10.9,0.18166666666666667,
+logmel_erda,12099.0,1.0,1.0,4,24,titan_rtx,4,2.0,,,Iterates over the dataset twice. Time out: exact time for log-mel extraction unknown.

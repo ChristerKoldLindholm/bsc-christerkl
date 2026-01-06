@@ -136,7 +136,7 @@ class PipelineSpecgram(torch.nn.Module):
         # Returns shape [C, F, T] for channels, freq bins and time frames.
         
         # p_ref is in Pa^2. Divide by micro-Pascals squared to get reference level.
-        spec_ref = spec / (1e-6**2) 
+        spec_ref = spec / (1e-6**2)
 
         if self.mel_scale is not None: 
             mel = self.mel_scale(spec_ref)
@@ -242,6 +242,7 @@ def tensors_to_array(dataloader, transform, max_pts=None, dtype=np.float32, devi
 
                 p = paths[b]
                 ids.append(Path(p).name if isinstance(p, (str, Path)) else str(p))
+                
     
     ids = np.array(ids, dtype=str)            
 
